@@ -1,28 +1,21 @@
 {
-  "name": "boticas-san-jose-ops",
+  "name": "boticas-san-josé-|-centro-de-operaciones",
   "private": true,
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "tsx server.ts",
+    "dev": "vite",
     "build": "vite build",
-    "lint": "tsc --noEmit",
     "preview": "vite preview"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.97.0",
-    "@tailwindcss/vite": "^4.2.0",
-    "@types/express": "^5.0.6",
+    "xlsx": "0.18.5",
     "exceljs": "4.4.0",
-    "express": "^5.2.1",
     "file-saver": "2.0.5",
-    "lucide-react": "^0.563.0",
-    "react": "^19.2.4",
-    "react-dom": "^19.2.4",
     "recharts": "^3.7.0",
-    "tailwindcss": "^4.2.0",
-    "tsx": "^4.21.0",
-    "xlsx": "0.18.5"
+    "react-dom": "^19.2.4",
+    "lucide-react": "^0.563.0",
+    "react": "^19.2.4"
   },
   "devDependencies": {
     "@types/node": "^22.14.0",
