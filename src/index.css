@@ -1,0 +1,67 @@
+@import "tailwindcss";
+
+@theme {
+  --color-odoo-primary: #714B67;
+  --color-odoo-secondary: #017e84;
+  --color-odoo-success: #10b981;
+  --color-odoo-warning: #f59e0b;
+  --color-odoo-danger: #ef4444;
+  --color-odoo-bg: #f8fafc;
+  --color-odoo-card: #ffffff;
+  
+  --font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+  
+  --radius-odoo-lg: 24px;
+
+  --animate-bounce-slow: bounce-slow 3s infinite;
+
+  @keyframes bounce-slow {
+    0%, 100% { transform: translateY(0); animation-timing-function: cubic-bezier(0.8,0,1,1); }
+    50% { transform: translateY(-10px); animation-timing-function: cubic-bezier(0,0,0.2,1); }
+  }
+
+  @keyframes fadeIn { 
+    from { opacity: 0; transform: translateY(15px); } 
+    to { opacity: 1; transform: translateY(0); } 
+  }
+}
+
+@layer base {
+  body {
+    @apply bg-odoo-bg text-slate-800 antialiased;
+    font-family: var(--font-sans);
+  }
+
+  input[type="date"]::-webkit-calendar-picker-indicator {
+    @apply opacity-50 cursor-pointer;
+  }
+}
+
+@layer components {
+  .o-btn {
+    @apply inline-flex items-center justify-center px-5 py-2.5 font-bold text-[13px] rounded-2xl transition-all cursor-pointer;
+  }
+
+  .o-btn-primary { 
+    @apply bg-odoo-primary text-white shadow-lg hover:-translate-y-0.5 hover:shadow-xl active:translate-y-0;
+  }
+
+  .o-sidebar-item {
+    @apply flex items-center gap-3.5 px-4.5 py-3 rounded-[20px] text-[13px] text-slate-400 font-semibold transition-all hover:bg-slate-50 hover:text-odoo-primary hover:translate-x-1;
+  }
+  
+  .o-sidebar-item.active { 
+    @apply bg-pink-50 text-odoo-primary font-extrabold shadow-sm;
+  }
+
+  .animate-fade { 
+    animation: fadeIn 0.5s ease-out forwards; 
+  }
+
+  .custom-scrollbar::-webkit-scrollbar { width: 5px; height: 5px; }
+  .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+  .custom-scrollbar::-webkit-scrollbar-thumb { background: #e2e8f0; border-radius: 10px; }
+  .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #714B67; }
+}
+
+

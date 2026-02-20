@@ -1,0 +1,7 @@
+{
+  "name": "Boticas San José | Centro de Operaciones",
+  "description": "Centro de Operaciones Integral: Gestión de Ventas, Inventario, Auditoría y Personal para Boticas San José.",
+  "requestFramePermissions": [
+    "geolocation"
+  ]
+}
