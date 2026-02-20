@@ -9,100 +9,364 @@ import {
 } from 'lucide-react';
 import { Employee, Shift } from '../types';
 import { shiftService } from '../services/supabaseService';
-import { utils, writeFile } from 'xlsx';
+import ExcelJS from 'exceljs';
+import { saveAs } from 'file-saver';
 
-// ─── Configuración horas por turno ───────────────────────────────────────────
+// ─── Constantes ───────────────────────────────────────────────────────────────
 const SHIFT_HOURS: Record<string, number> = {
   mañana: 8, tarde: 8, completo: 10, noche: 8, descanso: 0,
 };
-const SHIFT_LABEL: Record<string, string> = {
-  mañana: 'Mañana (07:00-15:00)', tarde: 'Tarde (14:00-22:00)',
-  completo: 'Completo (08:00-18:00)', noche: 'Noche (22:00-06:00)', descanso: 'Descanso',
+const SHIFT_COLORS: Record<string, { bg: string; fg: string; emoji: string }> = {
+  mañana:   { bg: 'DBEAFE', fg: '1E40AF', emoji: '🌅' },
+  tarde:    { bg: 'FEF9C3', fg: '92400E', emoji: '🌇' },
+  completo: { bg: 'DCFCE7', fg: '166534', emoji: '⚡' },
+  noche:    { bg: 'EDE9FE', fg: '5B21B6', emoji: '🌙' },
+  descanso: { bg: 'F1F5F9', fg: '64748B', emoji: '🛌' },
 };
 const MESES_ES = ['','Enero','Febrero','Marzo','Abril','Mayo','Junio',
                   'Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre'];
+const DIAS_ES  = ['Dom','Lun','Mar','Mié','Jue','Vie','Sáb'];
+const TAB_COLORS = ['714B67','017E84','2563EB','D97706','059669','DC2626','7C3AED','0891B2','65A30D','BE185D'];
+const META_HORAS = 192;
 
-function exportShiftsToExcel(shifts: Shift[]) {
-  const wb = utils.book_new();
-  const META_HORAS = 192;
+// ─── Helpers de estilo ExcelJS ────────────────────────────────────────────────
+const thin = { style: 'thin' as const, color: { argb: 'FFE2E8F0' } };
+const fullBorder = { top: thin, left: thin, bottom: thin, right: thin };
 
-  // ── Hoja 1: Resumen Mensual ────────────────────────────────────────────────
-  const summaryMap = new Map<string, any>();
-  shifts.forEach((sh) => {
-    let sortKey = '9999-99', mesAño = 'Desconocido';
-    try {
-      const d = new Date(sh.date + 'T00:00:00');
-      sortKey = d.toISOString().substring(0, 7);
-      mesAño = `${MESES_ES[d.getMonth() + 1]} ${d.getFullYear()}`;
-    } catch {}
+function hdrCell(ws: ExcelJS.Worksheet, row: number, col: number, value: string | number, bgArgb: string, fgArgb = 'FFFFFFFF', bold = true, size = 10) {
+  const c = ws.getCell(row, col);
+  c.value = value;
+  c.font = { name: 'Arial', size, bold, color: { argb: fgArgb } };
+  c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: bgArgb } };
+  c.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+  c.border = fullBorder;
+}
+
+function dataCell(ws: ExcelJS.Worksheet, row: number, col: number, value: string | number | null, opts: {
+  bold?: boolean; center?: boolean; bgArgb?: string; fgArgb?: string; numFmt?: string;
+} = {}) {
+  const c = ws.getCell(row, col);
+  c.value = value;
+  c.font = { name: 'Arial', size: 9, bold: opts.bold ?? false, color: { argb: opts.fgArgb ?? 'FF1E293B' } };
+  c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: opts.bgArgb ?? 'FFFFFFFF' } };
+  c.alignment = { horizontal: opts.center ? 'center' : 'left', vertical: 'middle' };
+  c.border = fullBorder;
+  if (opts.numFmt) c.numFmt = opts.numFmt;
+}
+
+// ─── Hoja resumen mensual consolidado ────────────────────────────────────────
+function buildSummarySheet(wb: ExcelJS.Workbook, shifts: Shift[]) {
+  const ws = wb.addWorksheet('📊 Resumen General', { properties: { tabColor: { argb: 'FF1E293B' } } });
+  ws.views = [{ showGridLines: false }];
+  ws.columns = [
+    { width: 16 },{ width: 26 },{ width: 28 },{ width: 20 },
+    { width: 11 },{ width: 11 },{ width: 12 },{ width: 11 },{ width: 12 },
+    { width: 10 },{ width: 14 },{ width: 12 },{ width: 13 },{ width: 15 },
+  ];
+
+  // Título
+  ws.mergeCells('A1:N1');
+  const t = ws.getCell('A1');
+  t.value = 'BOTICAS SAN JOSÉ — RESUMEN MENSUAL DE HORAS POR EMPLEADO';
+  t.font = { name: 'Arial', size: 13, bold: true, color: { argb: 'FFFFFFFF' } };
+  t.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1E293B' } };
+  t.alignment = { horizontal: 'center', vertical: 'middle' };
+  ws.getRow(1).height = 30;
+
+  ws.mergeCells('A2:N2');
+  const s = ws.getCell('A2');
+  s.value = `Mañana=8h | Tarde=8h | Noche=8h | Completo=10h | Descanso=0h   ·   Meta: ${META_HORAS}h/mes   ·   ${new Date().toLocaleDateString('es-PE')}`;
+  s.font = { name: 'Arial', size: 9, italic: true, color: { argb: 'FF64748B' } };
+  s.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF1F5F9' } };
+  s.alignment = { horizontal: 'center', vertical: 'middle' };
+  ws.getRow(2).height = 16;
+
+  const hdrs = ['MES/AÑO','EMPLEADO','EMAIL','SEDE','🌅 MAÑ','🌇 TARDE','⚡ COMP','🌙 NOCHE','🛌 DESC','DÍAS LAB','HRS TOTAL','PROM H/DÍA','META','CUMPL %'];
+  hdrs.forEach((h, i) => hdrCell(ws, 3, i + 1, h, i < 4 ? 'FF1E293B' : 'FF714B67'));
+  ws.getRow(3).height = 22;
+
+  // Agrupar datos
+  const map = new Map<string, any>();
+  shifts.forEach(sh => {
+    let sortKey = '9999-99', mesAño = '?';
+    try { const d = new Date(sh.date + 'T00:00:00'); sortKey = d.toISOString().substring(0, 7); mesAño = `${MESES_ES[d.getMonth() + 1]} ${d.getFullYear()}`; } catch {}
     const key = `${sortKey}||${sh.employee_name}||${sh.pos_name}`;
-    if (!summaryMap.has(key)) {
-      summaryMap.set(key, {
-        sortKey, mesAño,
-        employeeName: sh.employee_name, employeeEmail: sh.employee_email, posName: sh.pos_name,
-        mañana: 0, tarde: 0, completo: 0, noche: 0, descanso: 0,
-        diasLaborables: 0, totalHoras: 0,
-      });
-    }
-    const e = summaryMap.get(key);
-    if (sh.shift_type in e) e[sh.shift_type] += 1;
-    e.totalHoras += SHIFT_HOURS[sh.shift_type] ?? 0;
-    if (sh.shift_type !== 'descanso') e.diasLaborables += 1;
+    if (!map.has(key)) map.set(key, { sortKey, mesAño, name: sh.employee_name, email: sh.employee_email, sede: sh.pos_name, mañana:0,tarde:0,completo:0,noche:0,descanso:0,dias:0,total:0 });
+    const e = map.get(key);
+    if (sh.shift_type in e) e[sh.shift_type]++;
+    e.total += SHIFT_HOURS[sh.shift_type] ?? 0;
+    if (sh.shift_type !== 'descanso') e.dias++;
   });
 
-  const sorted = Array.from(summaryMap.values())
-    .sort((a, b) => a.sortKey.localeCompare(b.sortKey) || a.employeeName.localeCompare(b.employeeName));
+  const rows = Array.from(map.values()).sort((a, b) => a.sortKey.localeCompare(b.sortKey) || a.name.localeCompare(b.name));
+  rows.forEach((r, i) => {
+    const rowNum = i + 4;
+    const bg = i % 2 === 0 ? 'FFFFFFFF' : 'FFF8FAFC';
+    const prom = r.dias > 0 ? Math.round((r.total / r.dias) * 10) / 10 : 0;
+    const pct = Math.round((r.total / META_HORAS) * 1000) / 10;
+    const ok = r.total >= META_HORAS;
 
-  const data2: (string | number)[][] = [
-    ['BOTICAS SAN JOSÉ — RESUMEN MENSUAL DE HORAS POR EMPLEADO','','','','','','','','','','','','',''],
-    ['Mañana=8h | Tarde=8h | Noche=8h | Completo=10h | Descanso=0h   |   Meta estándar: 192h/mes','','','','','','','','','','','','',''],
-    ['MES / AÑO','EMPLEADO','EMAIL','SEDE','MAÑANA (días)','TARDE (días)','COMPLETO (días)',
-     'NOCHE (días)','DESCANSO (días)','DÍAS LAB.','HORAS TOTALES','PROM. H/DÍA','META MENSUAL','CUMPLIMIENTO %'],
-  ];
-  sorted.forEach(r => {
-    const prom = r.diasLaborables > 0 ? Math.round((r.totalHoras / r.diasLaborables) * 10) / 10 : 0;
-    const pct  = Math.round((r.totalHoras / META_HORAS) * 1000) / 10;
-    data2.push([r.mesAño, r.employeeName.toUpperCase(), r.employeeEmail, r.posName,
-      r.mañana||0, r.tarde||0, r.completo||0, r.noche||0, r.descanso||0,
-      r.diasLaborables, r.totalHoras, prom, META_HORAS, pct]);
+    dataCell(ws, rowNum, 1, r.mesAño, { bold: true, center: true, bgArgb: bg });
+    dataCell(ws, rowNum, 2, r.name.toUpperCase(), { bold: true, bgArgb: bg });
+    dataCell(ws, rowNum, 3, r.email, { bgArgb: bg });
+    dataCell(ws, rowNum, 4, r.sede, { bgArgb: bg });
+    (['mañana','tarde','completo','noche','descanso'] as const).forEach((st, si) => {
+      const cnt = r[st] || 0;
+      const sc = SHIFT_COLORS[st];
+      dataCell(ws, rowNum, si + 5, cnt > 0 ? cnt : '—', { center: true, bgArgb: cnt > 0 ? `FF${sc.bg}` : bg, fgArgb: cnt > 0 ? `FF${sc.fg}` : 'FF94A3B8', bold: cnt > 0 });
+    });
+    dataCell(ws, rowNum, 10, r.dias, { bold: true, center: true, bgArgb: bg });
+    const hc = ws.getCell(rowNum, 11);
+    hc.value = r.total; hc.numFmt = '0.0"h"';
+    hc.font = { name: 'Arial', size: 10, bold: true, color: { argb: 'FF714B67' } };
+    hc.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFDF4FF' } };
+    hc.alignment = { horizontal: 'center', vertical: 'middle' }; hc.border = fullBorder;
+    dataCell(ws, rowNum, 12, prom, { center: true, bgArgb: bg, numFmt: '0.0"h"' });
+    dataCell(ws, rowNum, 13, META_HORAS, { center: true, bgArgb: bg, numFmt: '0"h"' });
+    const mc = ws.getCell(rowNum, 14);
+    mc.value = `${ok ? '✅' : '⚠️'} ${pct}%`;
+    mc.font = { name: 'Arial', size: 9, bold: true, color: { argb: ok ? 'FF166534' : 'FF92400E' } };
+    mc.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: ok ? 'FFDCFCE7' : 'FFFEF9C3' } };
+    mc.alignment = { horizontal: 'center', vertical: 'middle' }; mc.border = fullBorder;
+    ws.getRow(rowNum).height = 17;
   });
+
   // Fila totales
-  data2.push(['TOTALES','','','',
-    sorted.reduce((a,b)=>a+b.mañana,0), sorted.reduce((a,b)=>a+b.tarde,0),
-    sorted.reduce((a,b)=>a+b.completo,0), sorted.reduce((a,b)=>a+b.noche,0),
-    sorted.reduce((a,b)=>a+b.descanso,0), sorted.reduce((a,b)=>a+b.diasLaborables,0),
-    sorted.reduce((a,b)=>a+b.totalHoras,0), '', '', '']);
+  const lr = rows.length + 4;
+  ws.mergeCells(`A${lr}:D${lr}`);
+  const tc = ws.getCell(`A${lr}`); tc.value = 'TOTALES GLOBALES';
+  tc.font = { name: 'Arial', size: 9, bold: true, color: { argb: 'FFFFFFFF' } };
+  tc.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1E293B' } };
+  tc.alignment = { horizontal: 'right', vertical: 'middle' }; tc.border = fullBorder;
+  ws.getRow(lr).height = 20;
+  (['mañana','tarde','completo','noche','descanso'] as const).forEach((st, si) => {
+    const tot = rows.reduce((a, b) => a + (b[st] || 0), 0);
+    hdrCell(ws, lr, si + 5, tot, 'FF1E293B');
+  });
+  hdrCell(ws, lr, 10, rows.reduce((a, b) => a + b.dias, 0), 'FF1E293B');
+  const th = ws.getCell(lr, 11); th.value = rows.reduce((a, b) => a + b.total, 0);
+  th.numFmt = '0.0"h"'; th.font = { name: 'Arial', size: 9, bold: true, color: { argb: 'FFFFFFFF' } };
+  th.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1E293B' } };
+  th.alignment = { horizontal: 'center', vertical: 'middle' }; th.border = fullBorder;
+  [12,13,14].forEach(c => hdrCell(ws, lr, c, '', 'FF1E293B'));
 
-  const ws2 = utils.aoa_to_sheet(data2);
-  ws2['!cols'] = [{wch:16},{wch:28},{wch:30},{wch:20},{wch:14},{wch:14},{wch:16},
-                  {wch:14},{wch:16},{wch:11},{wch:14},{wch:13},{wch:14},{wch:14}];
-  ws2['!merges'] = [{ s:{r:0,c:0}, e:{r:0,c:13} }, { s:{r:1,c:0}, e:{r:1,c:13} }];
-  utils.book_append_sheet(wb, ws2, '📊 Resumen Mensual');
+  ws.views = [{ state: 'frozen', ySplit: 3, showGridLines: false }];
+}
 
-  // ── Hoja 2: Referencia ────────────────────────────────────────────────────
-  const data3 = [
-    ['BOTICAS SAN JOSÉ — REFERENCIA DE TURNOS Y CÁLCULO DE HORAS'],
-    [''],
-    ['TIPO DE TURNO','HORAS POR DÍA','HORARIO REFERENCIAL','DESCRIPCIÓN'],
-    ['Mañana',   8,  '07:00 — 15:00', 'Turno de apertura de botica'],
-    ['Tarde',    8,  '14:00 — 22:00', 'Turno de cierre de botica'],
-    ['Completo', 10, '08:00 — 18:00', 'Turno extendido / cobertura especial'],
-    ['Noche',    8,  '22:00 — 06:00', 'Turno nocturno (24h)'],
-    ['Descanso', 0,  '—',             'Día libre / franco'],
-    [''],
-    ['FÓRMULAS DE CÁLCULO','','',''],
-    ['Meta Mensual Estándar:', '192 horas', '24 días laborables × 8 horas',''],
-    ['Total horas empleado:',  'Σ (turnos × horas/turno)', 'Suma según tipo de turno',''],
-    ['Cumplimiento (%):', '(Horas trabajadas / 192) × 100', 'Porcentaje sobre meta',''],
+// ─── Hoja por empleado ────────────────────────────────────────────────────────
+function buildEmployeeSheet(wb: ExcelJS.Workbook, empName: string, empEmail: string, empShifts: Shift[], tabColor: string) {
+  const ws = wb.addWorksheet(empName.substring(0, 28).split(' ').slice(0, 2).join(' '), {
+    properties: { tabColor: { argb: `FF${tabColor}` } }
+  });
+  ws.views = [{ showGridLines: false }];
+  ws.columns = [{ width: 5 },{ width: 14 },{ width: 10 },{ width: 22 },{ width: 18 },{ width: 10 },{ width: 10 },{ width: 9 },{ width: 14 }];
+
+  // Título
+  ws.mergeCells('A1:I1');
+  const t = ws.getCell('A1');
+  t.value = `BOTICAS SAN JOSÉ — HORARIO: ${empName.toUpperCase()}`;
+  t.font = { name: 'Arial', size: 12, bold: true, color: { argb: 'FFFFFFFF' } };
+  t.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: `FF${tabColor}` } };
+  t.alignment = { horizontal: 'center', vertical: 'middle' };
+  ws.getRow(1).height = 28;
+
+  ws.mergeCells('A2:I2');
+  const s = ws.getCell('A2');
+  s.value = `📧 ${empEmail}   ·   ${empShifts.length} turnos registrados   ·   ${new Date().toLocaleDateString('es-PE')}`;
+  s.font = { name: 'Arial', size: 8, italic: true, color: { argb: 'FF64748B' } };
+  s.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF1F5F9' } };
+  s.alignment = { horizontal: 'center', vertical: 'middle' };
+  ws.getRow(2).height = 15;
+
+  // Encabezados
+  ['#','FECHA','DÍA','SEDE / BOTICA','TIPO DE TURNO','ENTRADA','SALIDA','HORAS','ESTADO'].forEach((h, i) => {
+    hdrCell(ws, 3, i + 1, h, 'FF714B67');
+  });
+  ws.getRow(3).height = 20;
+
+  // Turnos ordenados
+  const sorted = [...empShifts].sort((a, b) => a.date.localeCompare(b.date));
+  let totalHoras = 0;
+
+  sorted.forEach((sh, i) => {
+    const r = i + 4;
+    const bg = i % 2 === 0 ? 'FFFFFFFF' : 'FFF8FAFC';
+    const sc = SHIFT_COLORS[sh.shift_type] || { bg: 'FFFFFF', fg: '1E293B', emoji: '' };
+    const horas = SHIFT_HOURS[sh.shift_type] ?? 0;
+    totalHoras += horas;
+    let dia = '—';
+    try { dia = DIAS_ES[new Date(sh.date + 'T00:00:00').getDay()]; } catch {}
+    const ok = sh.status === 'confirmed';
+
+    dataCell(ws, r, 1, i + 1, { center: true, bgArgb: bg });
+    dataCell(ws, r, 2, sh.date, { center: true, bgArgb: bg });
+    dataCell(ws, r, 3, dia, { center: true, bgArgb: bg });
+    dataCell(ws, r, 4, sh.pos_name, { bgArgb: bg });
+
+    // Celda turno con color propio
+    const tc = ws.getCell(r, 5);
+    tc.value = `${sc.emoji} ${sh.shift_type.toUpperCase()}`;
+    tc.font = { name: 'Arial', size: 9, bold: true, color: { argb: `FF${sc.fg}` } };
+    tc.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: `FF${sc.bg}` } };
+    tc.alignment = { horizontal: 'center', vertical: 'middle' }; tc.border = fullBorder;
+
+    dataCell(ws, r, 6, sh.start_time || '—', { center: true, bgArgb: bg });
+    dataCell(ws, r, 7, sh.end_time || '—', { center: true, bgArgb: bg });
+
+    const hc = ws.getCell(r, 8);
+    hc.value = horas; hc.numFmt = '0.0"h"';
+    hc.font = { name: 'Arial', size: 9, bold: true, color: { argb: horas === 0 ? 'FF94A3B8' : 'FF714B67' } };
+    hc.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: bg } };
+    hc.alignment = { horizontal: 'center', vertical: 'middle' }; hc.border = fullBorder;
+
+    const ec = ws.getCell(r, 9);
+    ec.value = ok ? '✅ Confirmado' : '⏳ Pendiente';
+    ec.font = { name: 'Arial', size: 8, bold: true, color: { argb: ok ? 'FF166534' : 'FF92400E' } };
+    ec.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: ok ? 'FFDCFCE7' : 'FFFEF9C3' } };
+    ec.alignment = { horizontal: 'center', vertical: 'middle' }; ec.border = fullBorder;
+    ws.getRow(r).height = 17;
+  });
+
+  // Fila total horas
+  const lr = sorted.length + 4;
+  ws.mergeCells(`A${lr}:G${lr}`);
+  const lc = ws.getCell(`A${lr}`); lc.value = 'TOTAL HORAS TRABAJADAS';
+  lc.font = { name: 'Arial', size: 10, bold: true, color: { argb: 'FFFFFFFF' } };
+  lc.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: `FF${tabColor}` } };
+  lc.alignment = { horizontal: 'right', vertical: 'middle' }; lc.border = fullBorder;
+  ws.getRow(lr).height = 22;
+
+  const hc = ws.getCell(lr, 8); hc.value = totalHoras; hc.numFmt = '0.0"h"';
+  hc.font = { name: 'Arial', size: 11, bold: true, color: { argb: 'FFFFFFFF' } };
+  hc.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: `FF${tabColor}` } };
+  hc.alignment = { horizontal: 'center', vertical: 'middle' }; hc.border = fullBorder;
+
+  const pct = Math.round((totalHoras / META_HORAS) * 1000) / 10;
+  const ok = totalHoras >= META_HORAS;
+  const mc = ws.getCell(lr, 9); mc.value = `${ok ? '✅' : '⚠️'} ${pct}% de ${META_HORAS}h`;
+  mc.font = { name: 'Arial', size: 9, bold: true, color: { argb: ok ? 'FF166534' : 'FF92400E' } };
+  mc.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: ok ? 'FFDCFCE7' : 'FFFEF9C3' } };
+  mc.alignment = { horizontal: 'center', vertical: 'middle' }; mc.border = fullBorder;
+
+  // Mini resumen por tipo de turno
+  const sr = lr + 2;
+  ws.mergeCells(`A${sr}:I${sr}`);
+  hdrCell(ws, sr, 1, 'RESUMEN POR TIPO DE TURNO', 'FF017E84');
+  ws.mergeCells(`A${sr}:I${sr}`);
+  ws.getRow(sr).height = 18;
+
+  let col = 1;
+  Object.entries(SHIFT_COLORS).forEach(([st, sc]) => {
+    const cnt = empShifts.filter(s => s.shift_type === st).length;
+    const hrs = cnt * (SHIFT_HOURS[st] ?? 0);
+    const lc2 = ws.getCell(sr + 1, col);
+    lc2.value = `${sc.emoji} ${st.toUpperCase()}`;
+    lc2.font = { name: 'Arial', size: 8, bold: true, color: { argb: `FF${sc.fg}` } };
+    lc2.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: `FF${sc.bg}` } };
+    lc2.alignment = { horizontal: 'center', vertical: 'middle' }; lc2.border = fullBorder;
+    const vc = ws.getCell(sr + 1, col + 1);
+    vc.value = `${cnt}d · ${hrs}h`;
+    vc.font = { name: 'Arial', size: 8, bold: true, color: { argb: 'FF1E293B' } };
+    vc.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF8FAFC' } };
+    vc.alignment = { horizontal: 'center', vertical: 'middle' }; vc.border = fullBorder;
+    col += 2;
+    ws.getRow(sr + 1).height = 18;
+  });
+
+  ws.views = [{ state: 'frozen', ySplit: 3, showGridLines: false }];
+}
+
+// ─── Hoja referencia ──────────────────────────────────────────────────────────
+function buildReferenceSheet(wb: ExcelJS.Workbook) {
+  const ws = wb.addWorksheet('📖 Referencia', { properties: { tabColor: { argb: 'FF64748B' } } });
+  ws.views = [{ showGridLines: false }];
+  ws.columns = [{ width: 5 },{ width: 22 },{ width: 14 },{ width: 28 },{ width: 20 },{ width: 16 }];
+
+  ws.mergeCells('B1:F1');
+  hdrCell(ws, 1, 2, 'BOTICAS SAN JOSÉ — REFERENCIA DE TURNOS Y CÁLCULO DE HORAS', 'FF1E293B', 'FFFFFFFF', true, 12);
+  ws.mergeCells('B1:F1');
+  ws.getRow(1).height = 26;
+
+  ['TURNO','HORAS/DÍA','HORARIO','DESCRIPCIÓN','VISTA PREVIA'].forEach((h, i) => hdrCell(ws, 3, i + 2, h, 'FF714B67'));
+  ws.getRow(3).height = 20;
+
+  const turnos = [
+    ['🌅 Mañana','mañana',8,'07:00 — 15:00','Turno apertura de botica'],
+    ['🌇 Tarde','tarde',8,'14:00 — 22:00','Turno cierre de botica'],
+    ['⚡ Completo','completo',10,'08:00 — 18:00','Turno extendido'],
+    ['🌙 Noche','noche',8,'22:00 — 06:00','Turno nocturno'],
+    ['🛌 Descanso','descanso',0,'—','Día libre / franco'],
   ];
-  const ws3 = utils.aoa_to_sheet(data3);
-  ws3['!cols'] = [{wch:22},{wch:16},{wch:24},{wch:36}];
-  ws3['!merges'] = [{ s:{r:0,c:0}, e:{r:0,c:3} }];
-  utils.book_append_sheet(wb, ws3, '📖 Referencia');
+  turnos.forEach(([label, st, hrs, horario, desc], i) => {
+    const r = i + 4;
+    const sc = SHIFT_COLORS[st as string];
+    [label, hrs, horario, desc].forEach((v, ci) => {
+      const c = ws.getCell(r, ci + 2);
+      c.value = v; c.font = { name: 'Arial', size: 9, bold: ci === 0, color: { argb: ci === 0 ? `FF${sc.fg}` : 'FF1E293B' } };
+      c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: `FF${sc.bg}` } };
+      c.alignment = { horizontal: ci < 3 ? 'center' : 'left', vertical: 'middle' }; c.border = fullBorder;
+    });
+    const vc = ws.getCell(r, 6); vc.value = '  Vista previa  ';
+    vc.font = { name: 'Arial', size: 9, bold: true, color: { argb: `FF${sc.fg}` } };
+    vc.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: `FF${sc.bg}` } };
+    vc.alignment = { horizontal: 'center', vertical: 'middle' }; vc.border = fullBorder;
+    ws.getRow(r).height = 20;
+  });
 
+  ws.mergeCells('B10:F10');
+  hdrCell(ws, 10, 2, '📐 FÓRMULAS DE CÁLCULO', 'FF017E84', 'FFFFFFFF', true, 10);
+  ws.mergeCells('B10:F10');
+  ws.getRow(10).height = 22;
+
+  [
+    ['Meta mensual:', '192 horas', '24 días laborables × 8 horas'],
+    ['Total horas:', 'Σ (días × horas_turno)', 'Suma ponderada por tipo de turno'],
+    ['Cumplimiento:', '(Horas / 192) × 100', '% sobre meta mensual'],
+    ['Promedio h/día:', 'Horas / Días laborables', 'Excluye días de descanso'],
+  ].forEach(([lbl, formula, nota], i) => {
+    const r = i + 11;
+    ws.getRow(r).height = 18;
+    const lc = ws.getCell(r, 2); lc.value = lbl; lc.font = { name: 'Arial', size: 9, bold: true, color: { argb: 'FF1E293B' } };
+    lc.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF0FDFA' } };
+    lc.alignment = { horizontal: 'right', vertical: 'middle' }; lc.border = fullBorder;
+    const fc = ws.getCell(r, 3); fc.value = formula; fc.font = { name: 'Arial', size: 9, bold: true, color: { argb: 'FF714B67' } };
+    fc.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF0FDFA' } };
+    fc.alignment = { horizontal: 'center', vertical: 'middle' }; fc.border = fullBorder;
+    ws.mergeCells(`D${r}:F${r}`);
+    const nc = ws.getCell(r, 4); nc.value = nota; nc.font = { name: 'Arial', size: 9, color: { argb: 'FF1E293B' } };
+    nc.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF0FDFA' } };
+    nc.alignment = { horizontal: 'left', vertical: 'middle', indent: 1 }; nc.border = fullBorder;
+  });
+}
+
+// ─── Función principal de exportación ────────────────────────────────────────
+async function exportShiftsToExcel(shifts: Shift[]) {
+  const wb = new ExcelJS.Workbook();
+  wb.creator = 'Boticas San José — Centro de Operaciones';
+  wb.created = new Date();
+
+  // Hoja resumen primero
+  buildSummarySheet(wb, shifts);
+  buildReferenceSheet(wb);
+
+  // Una pestaña por empleado
+  const empMap = new Map<number, { name: string; email: string; shifts: Shift[] }>();
+  shifts.forEach(sh => {
+    if (!empMap.has(sh.employee_id)) empMap.set(sh.employee_id, { name: sh.employee_name, email: sh.employee_email, shifts: [] });
+    empMap.get(sh.employee_id)!.shifts.push(sh);
+  });
+
+  Array.from(empMap.entries())
+    .sort((a, b) => a[1].name.localeCompare(b[1].name))
+    .forEach(([, emp], i) => {
+      buildEmployeeSheet(wb, emp.name, emp.email, emp.shifts, TAB_COLORS[i % TAB_COLORS.length]);
+    });
+
+  // Generar y descargar
+  const buffer = await wb.xlsx.writeBuffer();
   const now = new Date();
   const dateStr = `${now.getFullYear()}${String(now.getMonth()+1).padStart(2,'0')}${String(now.getDate()).padStart(2,'0')}`;
-  writeFile(wb, `Horarios_BoticasSanJose_${dateStr}.xlsx`);
+  saveAs(new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), `Horarios_BoticasSanJose_${dateStr}.xlsx`);
 }
 
 // ─── Botón de exportación ─────────────────────────────────────────────────────
@@ -115,11 +379,10 @@ const ExportShiftsButton: React.FC<{ shifts: Shift[] }> = ({ shifts }) => {
     if (status === 'loading') return;
     setStatus('loading');
     try {
-      await new Promise(r => setTimeout(r, 300));
-      exportShiftsToExcel(shifts);
+      await exportShiftsToExcel(shifts);
       setStatus('done');
       setTimeout(() => setStatus('idle'), 3000);
-    } catch { setStatus('idle'); }
+    } catch (e) { console.error(e); setStatus('idle'); }
   };
 
   return (
