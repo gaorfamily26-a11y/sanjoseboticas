@@ -4,10 +4,151 @@ import {
   Users, Calendar, Clock, Plus, X, RefreshCw, 
   ChevronLeft, ChevronRight, CalendarDays, Check, 
   MapPin, Sun, Moon, Zap, Coffee,
-  ShieldCheck, Briefcase, Info, ArrowRight, Eye, Trash2, Edit3, AlertCircle
+  ShieldCheck, Briefcase, Info, ArrowRight, Eye, Trash2, Edit3, AlertCircle,
+  FileSpreadsheet, Loader2, CheckCircle2
 } from 'lucide-react';
 import { Employee, Shift } from '../types';
 import { shiftService } from '../services/supabaseService';
+import { utils, writeFile } from 'xlsx';
+
+// ─── Configuración horas por turno ───────────────────────────────────────────
+const SHIFT_HOURS: Record<string, number> = {
+  mañana: 8, tarde: 8, completo: 10, noche: 8, descanso: 0,
+};
+const SHIFT_LABEL: Record<string, string> = {
+  mañana: 'Mañana (07:00-15:00)', tarde: 'Tarde (14:00-22:00)',
+  completo: 'Completo (08:00-18:00)', noche: 'Noche (22:00-06:00)', descanso: 'Descanso',
+};
+const MESES_ES = ['','Enero','Febrero','Marzo','Abril','Mayo','Junio',
+                  'Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre'];
+
+function exportShiftsToExcel(shifts: Shift[]) {
+  const wb = utils.book_new();
+  const META_HORAS = 192;
+
+  // ── Hoja 1: Resumen Mensual ────────────────────────────────────────────────
+  const summaryMap = new Map<string, any>();
+  shifts.forEach((sh) => {
+    let sortKey = '9999-99', mesAño = 'Desconocido';
+    try {
+      const d = new Date(sh.date + 'T00:00:00');
+      sortKey = d.toISOString().substring(0, 7);
+      mesAño = `${MESES_ES[d.getMonth() + 1]} ${d.getFullYear()}`;
+    } catch {}
+    const key = `${sortKey}||${sh.employee_name}||${sh.pos_name}`;
+    if (!summaryMap.has(key)) {
+      summaryMap.set(key, {
+        sortKey, mesAño,
+        employeeName: sh.employee_name, employeeEmail: sh.employee_email, posName: sh.pos_name,
+        mañana: 0, tarde: 0, completo: 0, noche: 0, descanso: 0,
+        diasLaborables: 0, totalHoras: 0,
+      });
+    }
+    const e = summaryMap.get(key);
+    if (sh.shift_type in e) e[sh.shift_type] += 1;
+    e.totalHoras += SHIFT_HOURS[sh.shift_type] ?? 0;
+    if (sh.shift_type !== 'descanso') e.diasLaborables += 1;
+  });
+
+  const sorted = Array.from(summaryMap.values())
+    .sort((a, b) => a.sortKey.localeCompare(b.sortKey) || a.employeeName.localeCompare(b.employeeName));
+
+  const data2: (string | number)[][] = [
+    ['BOTICAS SAN JOSÉ — RESUMEN MENSUAL DE HORAS POR EMPLEADO','','','','','','','','','','','','',''],
+    ['Mañana=8h | Tarde=8h | Noche=8h | Completo=10h | Descanso=0h   |   Meta estándar: 192h/mes','','','','','','','','','','','','',''],
+    ['MES / AÑO','EMPLEADO','EMAIL','SEDE','MAÑANA (días)','TARDE (días)','COMPLETO (días)',
+     'NOCHE (días)','DESCANSO (días)','DÍAS LAB.','HORAS TOTALES','PROM. H/DÍA','META MENSUAL','CUMPLIMIENTO %'],
+  ];
+  sorted.forEach(r => {
+    const prom = r.diasLaborables > 0 ? Math.round((r.totalHoras / r.diasLaborables) * 10) / 10 : 0;
+    const pct  = Math.round((r.totalHoras / META_HORAS) * 1000) / 10;
+    data2.push([r.mesAño, r.employeeName.toUpperCase(), r.employeeEmail, r.posName,
+      r.mañana||0, r.tarde||0, r.completo||0, r.noche||0, r.descanso||0,
+      r.diasLaborables, r.totalHoras, prom, META_HORAS, pct]);
+  });
+  // Fila totales
+  data2.push(['TOTALES','','','',
+    sorted.reduce((a,b)=>a+b.mañana,0), sorted.reduce((a,b)=>a+b.tarde,0),
+    sorted.reduce((a,b)=>a+b.completo,0), sorted.reduce((a,b)=>a+b.noche,0),
+    sorted.reduce((a,b)=>a+b.descanso,0), sorted.reduce((a,b)=>a+b.diasLaborables,0),
+    sorted.reduce((a,b)=>a+b.totalHoras,0), '', '', '']);
+
+  const ws2 = utils.aoa_to_sheet(data2);
+  ws2['!cols'] = [{wch:16},{wch:28},{wch:30},{wch:20},{wch:14},{wch:14},{wch:16},
+                  {wch:14},{wch:16},{wch:11},{wch:14},{wch:13},{wch:14},{wch:14}];
+  ws2['!merges'] = [{ s:{r:0,c:0}, e:{r:0,c:13} }, { s:{r:1,c:0}, e:{r:1,c:13} }];
+  utils.book_append_sheet(wb, ws2, '📊 Resumen Mensual');
+
+  // ── Hoja 2: Referencia ────────────────────────────────────────────────────
+  const data3 = [
+    ['BOTICAS SAN JOSÉ — REFERENCIA DE TURNOS Y CÁLCULO DE HORAS'],
+    [''],
+    ['TIPO DE TURNO','HORAS POR DÍA','HORARIO REFERENCIAL','DESCRIPCIÓN'],
+    ['Mañana',   8,  '07:00 — 15:00', 'Turno de apertura de botica'],
+    ['Tarde',    8,  '14:00 — 22:00', 'Turno de cierre de botica'],
+    ['Completo', 10, '08:00 — 18:00', 'Turno extendido / cobertura especial'],
+    ['Noche',    8,  '22:00 — 06:00', 'Turno nocturno (24h)'],
+    ['Descanso', 0,  '—',             'Día libre / franco'],
+    [''],
+    ['FÓRMULAS DE CÁLCULO','','',''],
+    ['Meta Mensual Estándar:', '192 horas', '24 días laborables × 8 horas',''],
+    ['Total horas empleado:',  'Σ (turnos × horas/turno)', 'Suma según tipo de turno',''],
+    ['Cumplimiento (%):', '(Horas trabajadas / 192) × 100', 'Porcentaje sobre meta',''],
+  ];
+  const ws3 = utils.aoa_to_sheet(data3);
+  ws3['!cols'] = [{wch:22},{wch:16},{wch:24},{wch:36}];
+  ws3['!merges'] = [{ s:{r:0,c:0}, e:{r:0,c:3} }];
+  utils.book_append_sheet(wb, ws3, '📖 Referencia');
+
+  const now = new Date();
+  const dateStr = `${now.getFullYear()}${String(now.getMonth()+1).padStart(2,'0')}${String(now.getDate()).padStart(2,'0')}`;
+  writeFile(wb, `Horarios_BoticasSanJose_${dateStr}.xlsx`);
+}
+
+// ─── Botón de exportación ─────────────────────────────────────────────────────
+const ExportShiftsButton: React.FC<{ shifts: Shift[] }> = ({ shifts }) => {
+  const [status, setStatus] = useState<'idle'|'loading'|'done'>('idle');
+  const totalHoras = shifts.reduce((acc, sh) => acc + (SHIFT_HOURS[sh.shift_type] ?? 0), 0);
+  const uniqueEmps = new Set(shifts.map(s => s.employee_id)).size;
+
+  const handle = async () => {
+    if (status === 'loading') return;
+    setStatus('loading');
+    try {
+      await new Promise(r => setTimeout(r, 300));
+      exportShiftsToExcel(shifts);
+      setStatus('done');
+      setTimeout(() => setStatus('idle'), 3000);
+    } catch { setStatus('idle'); }
+  };
+
+  return (
+    <div className="flex flex-col items-end gap-1">
+      <button
+        onClick={handle}
+        disabled={status === 'loading' || shifts.length === 0}
+        title={`${shifts.length} turnos · ${uniqueEmps} empleados · ${totalHoras}h`}
+        className={`flex items-center gap-2 px-5 py-3 rounded-2xl font-black text-[11px] uppercase tracking-widest transition-all shadow-sm
+          ${status === 'done'    ? 'bg-emerald-500 text-white shadow-emerald-200'
+          : status === 'loading' ? 'bg-slate-200 text-slate-400 cursor-not-allowed'
+          : 'bg-white border border-emerald-300 text-emerald-700 hover:bg-emerald-50 hover:border-emerald-400 hover:shadow-md hover:-translate-y-0.5'}`}
+      >
+        {status === 'loading' && <Loader2 size={16} className="animate-spin"/>}
+        {status === 'done'    && <CheckCircle2 size={16}/>}
+        {status === 'idle'    && <FileSpreadsheet size={16}/>}
+        <span>{status === 'loading' ? 'Generando...' : status === 'done' ? '¡Descargado!' : 'Exportar Excel'}</span>
+        {status === 'idle' && (
+          <span className="bg-emerald-100 text-emerald-600 text-[9px] px-1.5 py-0.5 rounded-full font-black">{shifts.length}</span>
+        )}
+      </button>
+      {status === 'idle' && shifts.length > 0 && (
+        <p className="text-[9px] font-bold text-slate-400 uppercase tracking-wider">
+          {uniqueEmps} empleados · {totalHoras}h registradas
+        </p>
+      )}
+    </div>
+  );
+};
 
 const DAYS_OF_WEEK = [
   { label: 'Dom', value: 0 },
@@ -346,7 +487,10 @@ export const StaffManagement: React.FC<{isAdmin: boolean; employees: Employee[];
                  <h3 className="text-sm font-black text-slate-600 uppercase tracking-widest">Consolidado Mensual de Staff</h3>
                  <p className="text-[10px] font-bold text-slate-400 uppercase mt-1 tracking-widest">Resumen ejecutivo por colaborador</p>
               </div>
-              <button onClick={() => { setSelectedEmployee(null); setShowAddShift(true); }} className="bg-odoo-primary text-white py-4 px-10 rounded-2xl text-[11px] font-black uppercase flex items-center gap-4 shadow-xl shadow-odoo-primary/20 transition-all hover:scale-105"><Plus size={20}/> Nuevo Rol Masivo</button>
+              <div className="flex items-center gap-4">
+                 <ExportShiftsButton shifts={shifts} />
+                 <button onClick={() => { setSelectedEmployee(null); setShowAddShift(true); }} className="bg-odoo-primary text-white py-4 px-10 rounded-2xl text-[11px] font-black uppercase flex items-center gap-4 shadow-xl shadow-odoo-primary/20 transition-all hover:scale-105"><Plus size={20}/> Nuevo Rol Masivo</button>
+              </div>
            </div>
            <div className="overflow-x-auto">
               <table className="w-full text-left">
