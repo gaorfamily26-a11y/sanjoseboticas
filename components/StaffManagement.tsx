@@ -9,14 +9,12 @@ import {
 } from 'lucide-react';
 import { Employee, Shift } from '../types';
 import { shiftService } from '../services/supabaseService';
-import ExcelJS from 'exceljs';
-import { saveAs } from 'file-saver';
 
 // ─── Constantes ───────────────────────────────────────────────────────────────
 const SHIFT_HOURS: Record<string, number> = {
   mañana: 8, tarde: 8, completo: 10, noche: 8, descanso: 0,
 };
-const SHIFT_COLORS: Record<string, { bg: string; fg: string; emoji: string }> = {
+const SHIFT_META: Record<string, { bg: string; fg: string; emoji: string }> = {
   mañana:   { bg: 'DBEAFE', fg: '1E40AF', emoji: '🌅' },
   tarde:    { bg: 'FEF9C3', fg: '92400E', emoji: '🌇' },
   completo: { bg: 'DCFCE7', fg: '166534', emoji: '⚡' },
@@ -29,344 +27,634 @@ const DIAS_ES  = ['Dom','Lun','Mar','Mié','Jue','Vie','Sáb'];
 const TAB_COLORS = ['714B67','017E84','2563EB','D97706','059669','DC2626','7C3AED','0891B2','65A30D','BE185D'];
 const META_HORAS = 192;
 
-// ─── Helpers de estilo ExcelJS ────────────────────────────────────────────────
-const thin = { style: 'thin' as const, color: { argb: 'FFE2E8F0' } };
-const fullBorder = { top: thin, left: thin, bottom: thin, right: thin };
+// ─── Generador XLSX nativo (XML + ZIP via base64) ─────────────────────────────
+// Compatible 100% navegador sin dependencias externas
 
-function hdrCell(ws: ExcelJS.Worksheet, row: number, col: number, value: string | number, bgArgb: string, fgArgb = 'FFFFFFFF', bold = true, size = 10) {
-  const c = ws.getCell(row, col);
-  c.value = value;
-  c.font = { name: 'Arial', size, bold, color: { argb: fgArgb } };
-  c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: bgArgb } };
-  c.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
-  c.border = fullBorder;
+type CellStyle = {
+  bgColor?: string;   // RRGGBB sin #
+  fgColor?: string;   // RRGGBB sin #
+  bold?: boolean;
+  size?: number;
+  hAlign?: 'left'|'center'|'right';
+  border?: boolean;
+  italic?: boolean;
+  numFmt?: string;    // e.g. '0.0'
+};
+
+interface XLSXCell {
+  v: string | number | null;
+  s?: CellStyle;
+  t?: 's'|'n';        // string | number
 }
 
-function dataCell(ws: ExcelJS.Worksheet, row: number, col: number, value: string | number | null, opts: {
-  bold?: boolean; center?: boolean; bgArgb?: string; fgArgb?: string; numFmt?: string;
-} = {}) {
-  const c = ws.getCell(row, col);
-  c.value = value;
-  c.font = { name: 'Arial', size: 9, bold: opts.bold ?? false, color: { argb: opts.fgArgb ?? 'FF1E293B' } };
-  c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: opts.bgArgb ?? 'FFFFFFFF' } };
-  c.alignment = { horizontal: opts.center ? 'center' : 'left', vertical: 'middle' };
-  c.border = fullBorder;
-  if (opts.numFmt) c.numFmt = opts.numFmt;
+interface XLSXSheet {
+  name: string;
+  tabColor?: string;
+  rows: (XLSXCell | null)[][];
+  colWidths?: number[];
+  merges?: { r1:number;c1:number;r2:number;c2:number }[];
+  freezeRow?: number;
 }
 
-// ─── Hoja resumen mensual consolidado ────────────────────────────────────────
-function buildSummarySheet(wb: ExcelJS.Workbook, shifts: Shift[]) {
-  const ws = wb.addWorksheet('📊 Resumen General', { properties: { tabColor: { argb: 'FF1E293B' } } });
-  ws.views = [{ showGridLines: false }];
-  ws.columns = [
-    { width: 16 },{ width: 26 },{ width: 28 },{ width: 20 },
-    { width: 11 },{ width: 11 },{ width: 12 },{ width: 11 },{ width: 12 },
-    { width: 10 },{ width: 14 },{ width: 12 },{ width: 13 },{ width: 15 },
-  ];
+// Paleta de estilos centralizados
+const S = {
+  hdrPrimary: (extra?: CellStyle): CellStyle => ({ bgColor:'714B67', fgColor:'FFFFFF', bold:true, size:10, hAlign:'center', border:true, ...extra }),
+  hdrDark:    (extra?: CellStyle): CellStyle => ({ bgColor:'1E293B', fgColor:'FFFFFF', bold:true, size:10, hAlign:'center', border:true, ...extra }),
+  hdrTeal:    (extra?: CellStyle): CellStyle => ({ bgColor:'017E84', fgColor:'FFFFFF', bold:true, size:10, hAlign:'center', border:true, ...extra }),
+  data:       (extra?: CellStyle): CellStyle => ({ bgColor:'FFFFFF', fgColor:'1E293B', size:9, border:true, ...extra }),
+  dataAlt:    (extra?: CellStyle): CellStyle => ({ bgColor:'F8FAFC', fgColor:'1E293B', size:9, border:true, ...extra }),
+  shift: (st: string, alt=false): CellStyle => {
+    const m = SHIFT_META[st] || { bg:'FFFFFF', fg:'1E293B' };
+    return { bgColor: m.bg, fgColor: m.fg, bold:true, size:9, hAlign:'center', border:true };
+  },
+  ok:  (extra?: CellStyle): CellStyle => ({ bgColor:'DCFCE7', fgColor:'166534', bold:true, size:9, hAlign:'center', border:true, ...extra }),
+  warn:(extra?: CellStyle): CellStyle => ({ bgColor:'FEF9C3', fgColor:'92400E', bold:true, size:9, hAlign:'center', border:true, ...extra }),
+  purple: (extra?: CellStyle): CellStyle => ({ bgColor:'FDF4FF', fgColor:'714B67', bold:true, size:10, hAlign:'center', border:true, ...extra }),
+};
 
-  // Título
-  ws.mergeCells('A1:N1');
-  const t = ws.getCell('A1');
-  t.value = 'BOTICAS SAN JOSÉ — RESUMEN MENSUAL DE HORAS POR EMPLEADO';
-  t.font = { name: 'Arial', size: 13, bold: true, color: { argb: 'FFFFFFFF' } };
-  t.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1E293B' } };
-  t.alignment = { horizontal: 'center', vertical: 'middle' };
-  ws.getRow(1).height = 30;
+function cell(v: string|number|null, s?: CellStyle): XLSXCell {
+  return { v, s, t: typeof v === 'number' ? 'n' : 's' };
+}
 
-  ws.mergeCells('A2:N2');
-  const s = ws.getCell('A2');
-  s.value = `Mañana=8h | Tarde=8h | Noche=8h | Completo=10h | Descanso=0h   ·   Meta: ${META_HORAS}h/mes   ·   ${new Date().toLocaleDateString('es-PE')}`;
-  s.font = { name: 'Arial', size: 9, italic: true, color: { argb: 'FF64748B' } };
-  s.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF1F5F9' } };
-  s.alignment = { horizontal: 'center', vertical: 'middle' };
-  ws.getRow(2).height = 16;
+// ─── Hoja resumen general ─────────────────────────────────────────────────────
+function makeSummarySheet(shifts: Shift[]): XLSXSheet {
+  const rows: (XLSXCell|null)[][] = [];
 
-  const hdrs = ['MES/AÑO','EMPLEADO','EMAIL','SEDE','🌅 MAÑ','🌇 TARDE','⚡ COMP','🌙 NOCHE','🛌 DESC','DÍAS LAB','HRS TOTAL','PROM H/DÍA','META','CUMPL %'];
-  hdrs.forEach((h, i) => hdrCell(ws, 3, i + 1, h, i < 4 ? 'FF1E293B' : 'FF714B67'));
-  ws.getRow(3).height = 22;
+  rows.push([cell('BOTICAS SAN JOSÉ — RESUMEN MENSUAL DE HORAS POR EMPLEADO', S.hdrDark({ size:13, hAlign:'left' })), null,null,null,null,null,null,null,null,null,null,null,null,null]);
+  rows.push([cell(`Mañana=8h | Tarde=8h | Noche=8h | Completo=10h | Descanso=0h   ·   Meta: ${META_HORAS}h/mes   ·   ${new Date().toLocaleDateString('es-PE')}`, { bgColor:'F1F5F9', fgColor:'64748B', size:9, italic:true, hAlign:'center' }), null,null,null,null,null,null,null,null,null,null,null,null,null]);
+  rows.push([
+    cell('MES/AÑO', S.hdrDark()), cell('EMPLEADO', S.hdrDark()), cell('EMAIL', S.hdrDark()), cell('SEDE', S.hdrDark()),
+    cell('🌅 MAÑ', S.hdrPrimary()), cell('🌇 TARDE', S.hdrPrimary()), cell('⚡ COMP', S.hdrPrimary()),
+    cell('🌙 NOCHE', S.hdrPrimary()), cell('🛌 DESC', S.hdrPrimary()),
+    cell('DÍAS LAB', S.hdrPrimary()), cell('HRS TOTAL', S.hdrPrimary()),
+    cell('PROM H/DÍA', S.hdrPrimary()), cell('META', S.hdrPrimary()), cell('CUMPL %', S.hdrPrimary()),
+  ]);
 
-  // Agrupar datos
+  // Agrupar
   const map = new Map<string, any>();
   shifts.forEach(sh => {
-    let sortKey = '9999-99', mesAño = '?';
-    try { const d = new Date(sh.date + 'T00:00:00'); sortKey = d.toISOString().substring(0, 7); mesAño = `${MESES_ES[d.getMonth() + 1]} ${d.getFullYear()}`; } catch {}
-    const key = `${sortKey}||${sh.employee_name}||${sh.pos_name}`;
-    if (!map.has(key)) map.set(key, { sortKey, mesAño, name: sh.employee_name, email: sh.employee_email, sede: sh.pos_name, mañana:0,tarde:0,completo:0,noche:0,descanso:0,dias:0,total:0 });
-    const e = map.get(key);
-    if (sh.shift_type in e) e[sh.shift_type]++;
-    e.total += SHIFT_HOURS[sh.shift_type] ?? 0;
-    if (sh.shift_type !== 'descanso') e.dias++;
+    let sortKey='9999-99', mes='?';
+    try { const d=new Date(sh.date+'T00:00:00'); sortKey=d.toISOString().substring(0,7); mes=`${MESES_ES[d.getMonth()+1]} ${d.getFullYear()}`; } catch {}
+    const key=`${sortKey}||${sh.employee_name}||${sh.pos_name}`;
+    if (!map.has(key)) map.set(key,{sortKey,mes,name:sh.employee_name,email:sh.employee_email,sede:sh.pos_name,mañana:0,tarde:0,completo:0,noche:0,descanso:0,dias:0,total:0});
+    const e=map.get(key);
+    if(sh.shift_type in e) e[sh.shift_type]++;
+    e.total+=SHIFT_HOURS[sh.shift_type]??0;
+    if(sh.shift_type!=='descanso') e.dias++;
   });
 
-  const rows = Array.from(map.values()).sort((a, b) => a.sortKey.localeCompare(b.sortKey) || a.name.localeCompare(b.name));
-  rows.forEach((r, i) => {
-    const rowNum = i + 4;
-    const bg = i % 2 === 0 ? 'FFFFFFFF' : 'FFF8FAFC';
-    const prom = r.dias > 0 ? Math.round((r.total / r.dias) * 10) / 10 : 0;
-    const pct = Math.round((r.total / META_HORAS) * 1000) / 10;
-    const ok = r.total >= META_HORAS;
-
-    dataCell(ws, rowNum, 1, r.mesAño, { bold: true, center: true, bgArgb: bg });
-    dataCell(ws, rowNum, 2, r.name.toUpperCase(), { bold: true, bgArgb: bg });
-    dataCell(ws, rowNum, 3, r.email, { bgArgb: bg });
-    dataCell(ws, rowNum, 4, r.sede, { bgArgb: bg });
-    (['mañana','tarde','completo','noche','descanso'] as const).forEach((st, si) => {
-      const cnt = r[st] || 0;
-      const sc = SHIFT_COLORS[st];
-      dataCell(ws, rowNum, si + 5, cnt > 0 ? cnt : '—', { center: true, bgArgb: cnt > 0 ? `FF${sc.bg}` : bg, fgArgb: cnt > 0 ? `FF${sc.fg}` : 'FF94A3B8', bold: cnt > 0 });
-    });
-    dataCell(ws, rowNum, 10, r.dias, { bold: true, center: true, bgArgb: bg });
-    const hc = ws.getCell(rowNum, 11);
-    hc.value = r.total; hc.numFmt = '0.0"h"';
-    hc.font = { name: 'Arial', size: 10, bold: true, color: { argb: 'FF714B67' } };
-    hc.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFDF4FF' } };
-    hc.alignment = { horizontal: 'center', vertical: 'middle' }; hc.border = fullBorder;
-    dataCell(ws, rowNum, 12, prom, { center: true, bgArgb: bg, numFmt: '0.0"h"' });
-    dataCell(ws, rowNum, 13, META_HORAS, { center: true, bgArgb: bg, numFmt: '0"h"' });
-    const mc = ws.getCell(rowNum, 14);
-    mc.value = `${ok ? '✅' : '⚠️'} ${pct}%`;
-    mc.font = { name: 'Arial', size: 9, bold: true, color: { argb: ok ? 'FF166534' : 'FF92400E' } };
-    mc.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: ok ? 'FFDCFCE7' : 'FFFEF9C3' } };
-    mc.alignment = { horizontal: 'center', vertical: 'middle' }; mc.border = fullBorder;
-    ws.getRow(rowNum).height = 17;
+  const dataRows = Array.from(map.values()).sort((a,b)=>a.sortKey.localeCompare(b.sortKey)||a.name.localeCompare(b.name));
+  dataRows.forEach((r,i) => {
+    const bg = i%2===0 ? S.data() : S.dataAlt();
+    const prom = r.dias>0 ? Math.round((r.total/r.dias)*10)/10 : 0;
+    const pct = Math.round((r.total/META_HORAS)*1000)/10;
+    const ok = r.total>=META_HORAS;
+    rows.push([
+      cell(r.mes, {...bg, bold:true, hAlign:'center'}),
+      cell(r.name.toUpperCase(), {...bg, bold:true}),
+      cell(r.email, bg),
+      cell(r.sede, bg),
+      ...((['mañana','tarde','completo','noche','descanso'] as const).map(st => {
+        const cnt=r[st]||0;
+        return cell(cnt>0?cnt:'—', cnt>0 ? S.shift(st) : {...bg, hAlign:'center', fgColor:'94A3B8'});
+      })),
+      cell(r.dias, {...bg, bold:true, hAlign:'center'}),
+      cell(r.total, S.purple({ numFmt:'0.0' })),
+      cell(prom, {...bg, hAlign:'center', numFmt:'0.0'}),
+      cell(META_HORAS, {...bg, hAlign:'center'}),
+      cell(`${ok?'✅':'⚠️'} ${pct}%`, ok ? S.ok() : S.warn()),
+    ]);
   });
 
-  // Fila totales
-  const lr = rows.length + 4;
-  ws.mergeCells(`A${lr}:D${lr}`);
-  const tc = ws.getCell(`A${lr}`); tc.value = 'TOTALES GLOBALES';
-  tc.font = { name: 'Arial', size: 9, bold: true, color: { argb: 'FFFFFFFF' } };
-  tc.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1E293B' } };
-  tc.alignment = { horizontal: 'right', vertical: 'middle' }; tc.border = fullBorder;
-  ws.getRow(lr).height = 20;
-  (['mañana','tarde','completo','noche','descanso'] as const).forEach((st, si) => {
-    const tot = rows.reduce((a, b) => a + (b[st] || 0), 0);
-    hdrCell(ws, lr, si + 5, tot, 'FF1E293B');
-  });
-  hdrCell(ws, lr, 10, rows.reduce((a, b) => a + b.dias, 0), 'FF1E293B');
-  const th = ws.getCell(lr, 11); th.value = rows.reduce((a, b) => a + b.total, 0);
-  th.numFmt = '0.0"h"'; th.font = { name: 'Arial', size: 9, bold: true, color: { argb: 'FFFFFFFF' } };
-  th.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1E293B' } };
-  th.alignment = { horizontal: 'center', vertical: 'middle' }; th.border = fullBorder;
-  [12,13,14].forEach(c => hdrCell(ws, lr, c, '', 'FF1E293B'));
+  // Totales
+  rows.push([
+    cell('TOTALES GLOBALES', S.hdrDark({ hAlign:'right' })), cell('',S.hdrDark()), cell('',S.hdrDark()), cell('',S.hdrDark()),
+    ...(['mañana','tarde','completo','noche','descanso'] as const).map(st => cell(dataRows.reduce((a,b)=>a+(b[st]||0),0), S.hdrDark())),
+    cell(dataRows.reduce((a,b)=>a+b.dias,0), S.hdrDark()),
+    cell(dataRows.reduce((a,b)=>a+b.total,0), S.hdrDark({ numFmt:'0.0' })),
+    cell('',S.hdrDark()), cell('',S.hdrDark()), cell('',S.hdrDark()),
+  ]);
 
-  ws.views = [{ state: 'frozen', ySplit: 3, showGridLines: false }];
+  return {
+    name: 'Resumen General',
+    tabColor: '1E293B',
+    rows,
+    colWidths: [16,26,28,20,9,9,9,9,9,10,12,12,10,13],
+    merges: [
+      {r1:0,c1:0,r2:0,c2:13},
+      {r1:1,c1:0,r2:1,c2:13},
+    ],
+    freezeRow: 3,
+  };
 }
 
 // ─── Hoja por empleado ────────────────────────────────────────────────────────
-function buildEmployeeSheet(wb: ExcelJS.Workbook, empName: string, empEmail: string, empShifts: Shift[], tabColor: string) {
-  const ws = wb.addWorksheet(empName.substring(0, 28).split(' ').slice(0, 2).join(' '), {
-    properties: { tabColor: { argb: `FF${tabColor}` } }
-  });
-  ws.views = [{ showGridLines: false }];
-  ws.columns = [{ width: 5 },{ width: 14 },{ width: 10 },{ width: 22 },{ width: 18 },{ width: 10 },{ width: 10 },{ width: 9 },{ width: 14 }];
+function makeEmployeeSheet(empName: string, empEmail: string, empShifts: Shift[], tabColor: string): XLSXSheet {
+  const sorted = [...empShifts].sort((a,b)=>a.date.localeCompare(b.date));
+  const rows: (XLSXCell|null)[][] = [];
+  const hdrColor = { bgColor:tabColor, fgColor:'FFFFFF', bold:true, size:11, border:true };
 
-  // Título
-  ws.mergeCells('A1:I1');
-  const t = ws.getCell('A1');
-  t.value = `BOTICAS SAN JOSÉ — HORARIO: ${empName.toUpperCase()}`;
-  t.font = { name: 'Arial', size: 12, bold: true, color: { argb: 'FFFFFFFF' } };
-  t.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: `FF${tabColor}` } };
-  t.alignment = { horizontal: 'center', vertical: 'middle' };
-  ws.getRow(1).height = 28;
+  rows.push([cell(`BOTICAS SAN JOSÉ — HORARIO: ${empName.toUpperCase()}`, {...hdrColor, hAlign:'center'}), null,null,null,null,null,null,null,null]);
+  rows.push([cell(`📧 ${empEmail}   ·   ${empShifts.length} turnos   ·   ${new Date().toLocaleDateString('es-PE')}`, { bgColor:'F1F5F9', fgColor:'64748B', size:8, italic:true, hAlign:'center' }), null,null,null,null,null,null,null,null]);
+  rows.push([
+    cell('#', S.hdrPrimary({ bgColor:tabColor })),
+    cell('FECHA', S.hdrPrimary({ bgColor:tabColor })),
+    cell('DÍA', S.hdrPrimary({ bgColor:tabColor })),
+    cell('SEDE / BOTICA', S.hdrPrimary({ bgColor:tabColor })),
+    cell('TIPO DE TURNO', S.hdrPrimary({ bgColor:tabColor })),
+    cell('ENTRADA', S.hdrPrimary({ bgColor:tabColor })),
+    cell('SALIDA', S.hdrPrimary({ bgColor:tabColor })),
+    cell('HORAS', S.hdrPrimary({ bgColor:tabColor })),
+    cell('ESTADO', S.hdrPrimary({ bgColor:tabColor })),
+  ]);
 
-  ws.mergeCells('A2:I2');
-  const s = ws.getCell('A2');
-  s.value = `📧 ${empEmail}   ·   ${empShifts.length} turnos registrados   ·   ${new Date().toLocaleDateString('es-PE')}`;
-  s.font = { name: 'Arial', size: 8, italic: true, color: { argb: 'FF64748B' } };
-  s.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF1F5F9' } };
-  s.alignment = { horizontal: 'center', vertical: 'middle' };
-  ws.getRow(2).height = 15;
-
-  // Encabezados
-  ['#','FECHA','DÍA','SEDE / BOTICA','TIPO DE TURNO','ENTRADA','SALIDA','HORAS','ESTADO'].forEach((h, i) => {
-    hdrCell(ws, 3, i + 1, h, 'FF714B67');
-  });
-  ws.getRow(3).height = 20;
-
-  // Turnos ordenados
-  const sorted = [...empShifts].sort((a, b) => a.date.localeCompare(b.date));
   let totalHoras = 0;
-
   sorted.forEach((sh, i) => {
-    const r = i + 4;
-    const bg = i % 2 === 0 ? 'FFFFFFFF' : 'FFF8FAFC';
-    const sc = SHIFT_COLORS[sh.shift_type] || { bg: 'FFFFFF', fg: '1E293B', emoji: '' };
-    const horas = SHIFT_HOURS[sh.shift_type] ?? 0;
+    const bg = i%2===0 ? S.data() : S.dataAlt();
+    const horas = SHIFT_HOURS[sh.shift_type]??0;
     totalHoras += horas;
-    let dia = '—';
-    try { dia = DIAS_ES[new Date(sh.date + 'T00:00:00').getDay()]; } catch {}
-    const ok = sh.status === 'confirmed';
-
-    dataCell(ws, r, 1, i + 1, { center: true, bgArgb: bg });
-    dataCell(ws, r, 2, sh.date, { center: true, bgArgb: bg });
-    dataCell(ws, r, 3, dia, { center: true, bgArgb: bg });
-    dataCell(ws, r, 4, sh.pos_name, { bgArgb: bg });
-
-    // Celda turno con color propio
-    const tc = ws.getCell(r, 5);
-    tc.value = `${sc.emoji} ${sh.shift_type.toUpperCase()}`;
-    tc.font = { name: 'Arial', size: 9, bold: true, color: { argb: `FF${sc.fg}` } };
-    tc.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: `FF${sc.bg}` } };
-    tc.alignment = { horizontal: 'center', vertical: 'middle' }; tc.border = fullBorder;
-
-    dataCell(ws, r, 6, sh.start_time || '—', { center: true, bgArgb: bg });
-    dataCell(ws, r, 7, sh.end_time || '—', { center: true, bgArgb: bg });
-
-    const hc = ws.getCell(r, 8);
-    hc.value = horas; hc.numFmt = '0.0"h"';
-    hc.font = { name: 'Arial', size: 9, bold: true, color: { argb: horas === 0 ? 'FF94A3B8' : 'FF714B67' } };
-    hc.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: bg } };
-    hc.alignment = { horizontal: 'center', vertical: 'middle' }; hc.border = fullBorder;
-
-    const ec = ws.getCell(r, 9);
-    ec.value = ok ? '✅ Confirmado' : '⏳ Pendiente';
-    ec.font = { name: 'Arial', size: 8, bold: true, color: { argb: ok ? 'FF166534' : 'FF92400E' } };
-    ec.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: ok ? 'FFDCFCE7' : 'FFFEF9C3' } };
-    ec.alignment = { horizontal: 'center', vertical: 'middle' }; ec.border = fullBorder;
-    ws.getRow(r).height = 17;
+    let dia='—'; try { dia=DIAS_ES[new Date(sh.date+'T00:00:00').getDay()]; } catch {}
+    const ok = sh.status==='confirmed';
+    rows.push([
+      cell(i+1, {...bg, hAlign:'center'}),
+      cell(sh.date, {...bg, hAlign:'center'}),
+      cell(dia, {...bg, hAlign:'center'}),
+      cell(sh.pos_name, bg),
+      cell(`${SHIFT_META[sh.shift_type]?.emoji||''} ${sh.shift_type.toUpperCase()}`, S.shift(sh.shift_type)),
+      cell(sh.start_time||'—', {...bg, hAlign:'center'}),
+      cell(sh.end_time||'—', {...bg, hAlign:'center'}),
+      cell(horas, { bgColor:bg.bgColor, fgColor: horas===0?'94A3B8':'714B67', bold:true, size:9, hAlign:'center', border:true, numFmt:'0.0' }),
+      cell(ok?'✅ Confirmado':'⏳ Pendiente', ok ? S.ok({size:8}) : S.warn({size:8})),
+    ]);
   });
 
-  // Fila total horas
-  const lr = sorted.length + 4;
-  ws.mergeCells(`A${lr}:G${lr}`);
-  const lc = ws.getCell(`A${lr}`); lc.value = 'TOTAL HORAS TRABAJADAS';
-  lc.font = { name: 'Arial', size: 10, bold: true, color: { argb: 'FFFFFFFF' } };
-  lc.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: `FF${tabColor}` } };
-  lc.alignment = { horizontal: 'right', vertical: 'middle' }; lc.border = fullBorder;
-  ws.getRow(lr).height = 22;
+  // Total
+  const pct = Math.round((totalHoras/META_HORAS)*1000)/10;
+  const ok = totalHoras>=META_HORAS;
+  rows.push([
+    cell('TOTAL HORAS TRABAJADAS', {...hdrColor, hAlign:'right'}), null,null,null,null,null,null,
+    cell(totalHoras, {...hdrColor, size:12, numFmt:'0.0'}),
+    cell(`${ok?'✅':'⚠️'} ${pct}% de ${META_HORAS}h`, ok ? S.ok() : S.warn()),
+  ]);
 
-  const hc = ws.getCell(lr, 8); hc.value = totalHoras; hc.numFmt = '0.0"h"';
-  hc.font = { name: 'Arial', size: 11, bold: true, color: { argb: 'FFFFFFFF' } };
-  hc.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: `FF${tabColor}` } };
-  hc.alignment = { horizontal: 'center', vertical: 'middle' }; hc.border = fullBorder;
+  // Mini resumen
+  rows.push([null,null,null,null,null,null,null,null,null]);
+  rows.push([cell('RESUMEN POR TIPO DE TURNO', S.hdrTeal()), null,null,null,null,null,null,null,null]);
 
-  const pct = Math.round((totalHoras / META_HORAS) * 1000) / 10;
-  const ok = totalHoras >= META_HORAS;
-  const mc = ws.getCell(lr, 9); mc.value = `${ok ? '✅' : '⚠️'} ${pct}% de ${META_HORAS}h`;
-  mc.font = { name: 'Arial', size: 9, bold: true, color: { argb: ok ? 'FF166534' : 'FF92400E' } };
-  mc.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: ok ? 'FFDCFCE7' : 'FFFEF9C3' } };
-  mc.alignment = { horizontal: 'center', vertical: 'middle' }; mc.border = fullBorder;
-
-  // Mini resumen por tipo de turno
-  const sr = lr + 2;
-  ws.mergeCells(`A${sr}:I${sr}`);
-  hdrCell(ws, sr, 1, 'RESUMEN POR TIPO DE TURNO', 'FF017E84');
-  ws.mergeCells(`A${sr}:I${sr}`);
-  ws.getRow(sr).height = 18;
-
-  let col = 1;
-  Object.entries(SHIFT_COLORS).forEach(([st, sc]) => {
-    const cnt = empShifts.filter(s => s.shift_type === st).length;
-    const hrs = cnt * (SHIFT_HOURS[st] ?? 0);
-    const lc2 = ws.getCell(sr + 1, col);
-    lc2.value = `${sc.emoji} ${st.toUpperCase()}`;
-    lc2.font = { name: 'Arial', size: 8, bold: true, color: { argb: `FF${sc.fg}` } };
-    lc2.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: `FF${sc.bg}` } };
-    lc2.alignment = { horizontal: 'center', vertical: 'middle' }; lc2.border = fullBorder;
-    const vc = ws.getCell(sr + 1, col + 1);
-    vc.value = `${cnt}d · ${hrs}h`;
-    vc.font = { name: 'Arial', size: 8, bold: true, color: { argb: 'FF1E293B' } };
-    vc.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF8FAFC' } };
-    vc.alignment = { horizontal: 'center', vertical: 'middle' }; vc.border = fullBorder;
-    col += 2;
-    ws.getRow(sr + 1).height = 18;
+  const summaryRow: (XLSXCell|null)[] = [];
+  Object.entries(SHIFT_META).forEach(([st, m]) => {
+    const cnt = empShifts.filter(s=>s.shift_type===st).length;
+    const hrs = cnt*(SHIFT_HOURS[st]??0);
+    summaryRow.push(cell(`${m.emoji} ${st.toUpperCase()}`, S.shift(st)));
+    summaryRow.push(cell(`${cnt}d · ${hrs}h`, S.data({ hAlign:'center' })));
   });
+  // Pad to 9 cols
+  while (summaryRow.length < 9) summaryRow.push(null);
+  rows.push(summaryRow);
 
-  ws.views = [{ state: 'frozen', ySplit: 3, showGridLines: false }];
+  return {
+    name: empName.substring(0,28).split(' ').slice(0,2).join(' '),
+    tabColor,
+    rows,
+    colWidths: [5,13,9,22,18,9,9,9,14],
+    merges: [
+      {r1:0,c1:0,r2:0,c2:8},
+      {r1:1,c1:0,r2:1,c2:8},
+      {r1:rows.length-2,c1:0,r2:rows.length-2,c2:8},
+      {r1:rows.length-3,c1:0,r2:rows.length-3,c2:6},  // total merge
+    ],
+    freezeRow: 3,
+  };
 }
 
 // ─── Hoja referencia ──────────────────────────────────────────────────────────
-function buildReferenceSheet(wb: ExcelJS.Workbook) {
-  const ws = wb.addWorksheet('📖 Referencia', { properties: { tabColor: { argb: 'FF64748B' } } });
-  ws.views = [{ showGridLines: false }];
-  ws.columns = [{ width: 5 },{ width: 22 },{ width: 14 },{ width: 28 },{ width: 20 },{ width: 16 }];
+function makeReferenceSheet(): XLSXSheet {
+  const rows: (XLSXCell|null)[][] = [];
+  rows.push([cell('BOTICAS SAN JOSÉ — REFERENCIA DE TURNOS Y CÁLCULO DE HORAS', S.hdrDark({size:12,hAlign:'center'})), null,null,null,null]);
+  rows.push([null,null,null,null,null]);
+  rows.push([
+    cell('TURNO', S.hdrPrimary()), cell('H/DÍA', S.hdrPrimary()),
+    cell('HORARIO', S.hdrPrimary()), cell('DESCRIPCIÓN', S.hdrPrimary()), cell('COLOR', S.hdrPrimary()),
+  ]);
+  ([
+    ['mañana',  '🌅 Mañana',   8,  '07:00 — 15:00', 'Turno apertura de botica'],
+    ['tarde',   '🌇 Tarde',    8,  '14:00 — 22:00', 'Turno cierre de botica'],
+    ['completo','⚡ Completo', 10, '08:00 — 18:00', 'Turno extendido'],
+    ['noche',   '🌙 Noche',    8,  '22:00 — 06:00', 'Turno nocturno'],
+    ['descanso','🛌 Descanso',  0,  '—',            'Día libre / franco'],
+  ] as const).forEach(([st, label, hrs, hor, desc]) => {
+    rows.push([
+      cell(label, S.shift(st as string)), cell(hrs, S.shift(st as string)),
+      cell(hor, S.shift(st as string)),   cell(desc, {...S.shift(st as string), hAlign:'left'}),
+      cell('  Vista previa  ', S.shift(st as string)),
+    ]);
+  });
+  rows.push([null,null,null,null,null]);
+  rows.push([cell('📐 FÓRMULAS DE CÁLCULO', S.hdrTeal({hAlign:'left'})), null,null,null,null]);
+  ([
+    ['Meta mensual:',   '192 horas',                    '24 días laborables × 8 horas'],
+    ['Total horas:',    'Σ (días × horas_turno)',        'Suma ponderada por tipo de turno'],
+    ['Cumplimiento:',   '(Horas / 192) × 100',          '% sobre meta mensual'],
+    ['Promedio h/día:', 'Horas / Días laborables',       'Excluye días de descanso'],
+  ] as const).forEach(([lbl, formula, nota]) => {
+    rows.push([
+      cell(lbl, {...S.data({hAlign:'right'}), bgColor:'F0FDFA', bold:true }),
+      cell(formula, {...S.data({hAlign:'center'}), bgColor:'F0FDFA', fgColor:'714B67', bold:true }),
+      cell(nota, {...S.data(), bgColor:'F0FDFA' }),
+      null, null,
+    ]);
+  });
+  return {
+    name: 'Referencia',
+    tabColor: '64748B',
+    rows,
+    colWidths: [20,14,24,36,16],
+    merges: [
+      {r1:0,c1:0,r2:0,c2:4},
+      {r1:9,c1:0,r2:9,c2:4},
+    ],
+  };
+}
 
-  ws.mergeCells('B1:F1');
-  hdrCell(ws, 1, 2, 'BOTICAS SAN JOSÉ — REFERENCIA DE TURNOS Y CÁLCULO DE HORAS', 'FF1E293B', 'FFFFFFFF', true, 12);
-  ws.mergeCells('B1:F1');
-  ws.getRow(1).height = 26;
+// ─── Motor XLSX (XML nativo, sin dependencias) ────────────────────────────────
+function buildXLSX(sheets: XLSXSheet[]): Blob {
+  const escXml = (s: string) => String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&apos;');
 
-  ['TURNO','HORAS/DÍA','HORARIO','DESCRIPCIÓN','VISTA PREVIA'].forEach((h, i) => hdrCell(ws, 3, i + 2, h, 'FF714B67'));
-  ws.getRow(3).height = 20;
+  // Recolectar strings compartidos
+  const sharedStrings: string[] = [];
+  const ssMap = new Map<string,number>();
+  function getSI(val: string): number {
+    if (ssMap.has(val)) return ssMap.get(val)!;
+    const idx = sharedStrings.length;
+    sharedStrings.push(val); ssMap.set(val,idx);
+    return idx;
+  }
 
-  const turnos = [
-    ['🌅 Mañana','mañana',8,'07:00 — 15:00','Turno apertura de botica'],
-    ['🌇 Tarde','tarde',8,'14:00 — 22:00','Turno cierre de botica'],
-    ['⚡ Completo','completo',10,'08:00 — 18:00','Turno extendido'],
-    ['🌙 Noche','noche',8,'22:00 — 06:00','Turno nocturno'],
-    ['🛌 Descanso','descanso',0,'—','Día libre / franco'],
-  ];
-  turnos.forEach(([label, st, hrs, horario, desc], i) => {
-    const r = i + 4;
-    const sc = SHIFT_COLORS[st as string];
-    [label, hrs, horario, desc].forEach((v, ci) => {
-      const c = ws.getCell(r, ci + 2);
-      c.value = v; c.font = { name: 'Arial', size: 9, bold: ci === 0, color: { argb: ci === 0 ? `FF${sc.fg}` : 'FF1E293B' } };
-      c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: `FF${sc.bg}` } };
-      c.alignment = { horizontal: ci < 3 ? 'center' : 'left', vertical: 'middle' }; c.border = fullBorder;
+  // Recolectar estilos únicos
+  interface StyleDef { bgColor?:string; fgColor?:string; bold?:boolean; size?:number; hAlign?:string; border?:boolean; italic?:boolean; numFmt?:string; }
+  const stylesList: StyleDef[] = [{}]; // índice 0 = default
+  const styleMap = new Map<string,number>();
+  function getStyle(s?: CellStyle): number {
+    if (!s) return 0;
+    const key = JSON.stringify(s);
+    if (styleMap.has(key)) return styleMap.get(key)!;
+    const idx = stylesList.length;
+    stylesList.push(s); styleMap.set(key,idx);
+    return idx;
+  }
+
+  // Recolectar formatos numéricos únicos
+  const numFmts: string[] = [];
+  const numFmtMap = new Map<string,number>();
+  function getNumFmtId(fmt?: string): number {
+    if (!fmt) return 0;
+    if (numFmtMap.has(fmt)) return numFmtMap.get(fmt)!;
+    const id = 164 + numFmts.length;
+    numFmts.push(fmt); numFmtMap.set(fmt,id);
+    return id;
+  }
+
+  // Pre-scan para colectar styles y strings
+  sheets.forEach(sh => {
+    sh.rows.forEach(row => {
+      if (!row) return;
+      row.forEach(c => {
+        if (!c) return;
+        getStyle(c.s);
+        if (c.s?.numFmt) getNumFmtId(c.s.numFmt);
+        if (typeof c.v === 'string' && c.v !== '') getSI(c.v);
+      });
     });
-    const vc = ws.getCell(r, 6); vc.value = '  Vista previa  ';
-    vc.font = { name: 'Arial', size: 9, bold: true, color: { argb: `FF${sc.fg}` } };
-    vc.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: `FF${sc.bg}` } };
-    vc.alignment = { horizontal: 'center', vertical: 'middle' }; vc.border = fullBorder;
-    ws.getRow(r).height = 20;
   });
 
-  ws.mergeCells('B10:F10');
-  hdrCell(ws, 10, 2, '📐 FÓRMULAS DE CÁLCULO', 'FF017E84', 'FFFFFFFF', true, 10);
-  ws.mergeCells('B10:F10');
-  ws.getRow(10).height = 22;
+  // Col letter helper
+  function colLetter(n: number): string {
+    let s=''; n++;
+    while(n>0){ n--; s=String.fromCharCode(65+(n%26))+s; n=Math.floor(n/26); }
+    return s;
+  }
 
-  [
-    ['Meta mensual:', '192 horas', '24 días laborables × 8 horas'],
-    ['Total horas:', 'Σ (días × horas_turno)', 'Suma ponderada por tipo de turno'],
-    ['Cumplimiento:', '(Horas / 192) × 100', '% sobre meta mensual'],
-    ['Promedio h/día:', 'Horas / Días laborables', 'Excluye días de descanso'],
-  ].forEach(([lbl, formula, nota], i) => {
-    const r = i + 11;
-    ws.getRow(r).height = 18;
-    const lc = ws.getCell(r, 2); lc.value = lbl; lc.font = { name: 'Arial', size: 9, bold: true, color: { argb: 'FF1E293B' } };
-    lc.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF0FDFA' } };
-    lc.alignment = { horizontal: 'right', vertical: 'middle' }; lc.border = fullBorder;
-    const fc = ws.getCell(r, 3); fc.value = formula; fc.font = { name: 'Arial', size: 9, bold: true, color: { argb: 'FF714B67' } };
-    fc.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF0FDFA' } };
-    fc.alignment = { horizontal: 'center', vertical: 'middle' }; fc.border = fullBorder;
-    ws.mergeCells(`D${r}:F${r}`);
-    const nc = ws.getCell(r, 4); nc.value = nota; nc.font = { name: 'Arial', size: 9, color: { argb: 'FF1E293B' } };
-    nc.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF0FDFA' } };
-    nc.alignment = { horizontal: 'left', vertical: 'middle', indent: 1 }; nc.border = fullBorder;
+  // Generar XML de cada hoja
+  function sheetXml(sh: XLSXSheet): string {
+    const colsXml = sh.colWidths
+      ? sh.colWidths.map((w,i)=>`<col min="${i+1}" max="${i+1}" width="${w}" customWidth="1"/>`).join('')
+      : '';
+
+    const rowsXml = sh.rows.map((row, ri) => {
+      if (!row || row.every(c=>c===null)) return `<row r="${ri+1}"/>`;
+      const cells = row.map((c,ci) => {
+        if (!c) return '';
+        const addr = `${colLetter(ci)}${ri+1}`;
+        const si = getStyle(c.s);
+        if (typeof c.v === 'number') {
+          const nfId = getNumFmtId(c.s?.numFmt);
+          return `<c r="${addr}" s="${si}" t="n"><v>${c.v}</v></c>`;
+        }
+        if (c.v === null || c.v === '') return `<c r="${addr}" s="${si}"/>`;
+        const idx = getSI(String(c.v));
+        return `<c r="${addr}" s="${si}" t="s"><v>${idx}</v></c>`;
+      }).join('');
+      return `<row r="${ri+1}">${cells}</row>`;
+    }).join('');
+
+    const mergesXml = sh.merges && sh.merges.length > 0
+      ? `<mergeCells count="${sh.merges.length}">${sh.merges.map(m=>`<mergeCell ref="${colLetter(m.c1)}${m.r1+1}:${colLetter(m.c2)}${m.r2+1}"/>`).join('')}</mergeCells>`
+      : '';
+
+    const freezeXml = sh.freezeRow
+      ? `<sheetViews><sheetView workbookViewId="0"><pane ySplit="${sh.freezeRow}" topLeftCell="A${sh.freezeRow+1}" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>`
+      : '<sheetViews><sheetView workbookViewId="0"/></sheetViews>';
+
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+${freezeXml}
+<cols>${colsXml}</cols>
+<sheetData>${rowsXml}</sheetData>
+${mergesXml}
+</worksheet>`;
+  }
+
+  // Estilos XML
+  function stylesXml(): string {
+    const numFmtsXml = numFmts.length > 0
+      ? `<numFmts count="${numFmts.length}">${numFmts.map((f,i)=>`<numFmt numFmtId="${164+i}" formatCode="${escXml(f)}"/>`).join('')}</numFmts>`
+      : '<numFmts count="0"/>';
+
+    const fonts = stylesList.map(s => `<font>
+      <sz val="${s.size||9}"/>
+      <color rgb="FF${s.fgColor||'1E293B'}"/>
+      <name val="Arial"/>
+      ${s.bold?'<b/>':''}
+      ${s.italic?'<i/>':''}
+    </font>`);
+
+    const fills = [`<fill><patternFill patternType="none"/></fill>`,`<fill><patternFill patternType="gray125"/></fill>`,
+      ...stylesList.map(s => s.bgColor
+        ? `<fill><patternFill patternType="solid"><fgColor rgb="FF${s.bgColor}"/><bgColor indexed="64"/></patternFill></fill>`
+        : `<fill><patternFill patternType="none"/></fill>`)
+    ];
+
+    const thinBorder = `<border><left style="thin"><color rgb="FFE2E8F0"/></left><right style="thin"><color rgb="FFE2E8F0"/></right><top style="thin"><color rgb="FFE2E8F0"/></top><bottom style="thin"><color rgb="FFE2E8F0"/></bottom></border>`;
+    const noBorder = `<border><left/><right/><top/><bottom/></border>`;
+    const borders = stylesList.map(s => s.border ? thinBorder : noBorder);
+
+    const cellXfs = stylesList.map((s, i) => {
+      const nfId = s.numFmt ? getNumFmtId(s.numFmt) : 0;
+      const ha = s.hAlign || 'left';
+      return `<xf numFmtId="${nfId}" fontId="${i}" fillId="${i+2}" borderId="${i}" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1" applyNumberFormat="${nfId>0?1:0}">
+        <alignment horizontal="${ha}" vertical="center" wrapText="0"/>
+      </xf>`;
+    });
+
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+${numFmtsXml}
+<fonts count="${stylesList.length}">${fonts.join('')}</fonts>
+<fills count="${fills.length}">${fills.join('')}</fills>
+<borders count="${borders.length}">${borders.join('')}</borders>
+<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+<cellXfs count="${cellXfs.length}">${cellXfs.join('')}</cellXfs>
+</styleSheet>`;
+  }
+
+  // Shared strings XML
+  function ssXml(): string {
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="${sharedStrings.length}" uniqueCount="${sharedStrings.length}">
+${sharedStrings.map(s=>`<si><t xml:space="preserve">${escXml(s)}</t></si>`).join('')}
+</sst>`;
+  }
+
+  // Workbook XML
+  function workbookXml(): string {
+    const sheetsXml = sheets.map((sh,i)=>
+      `<sheet name="${escXml(sh.name)}" sheetId="${i+1}" r:id="rId${i+1}"/>`
+    ).join('');
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<sheets>${sheetsXml}</sheets>
+</workbook>`;
+  }
+
+  function workbookRels(): string {
+    const rels = sheets.map((sh,i)=>
+      `<Relationship Id="rId${i+1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${i+1}.xml"/>`
+    ).join('');
+    const extra = `<Relationship Id="rId${sheets.length+1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>
+<Relationship Id="rId${sheets.length+2}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>`;
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+${rels}${extra}
+</Relationships>`;
+  }
+
+  // Tab colors en sheetViews no funciona en estándar OOXML, pero se puede poner en workbook
+  // Usar xl/worksheets/*.xml sheetPr tabColor
+  function sheetXmlWithTab(sh: XLSXSheet): string {
+    const tabXml = sh.tabColor ? `<sheetPr><tabColor rgb="FF${sh.tabColor}"/></sheetPr>` : '';
+    const colsXml = sh.colWidths
+      ? sh.colWidths.map((w,i)=>`<col min="${i+1}" max="${i+1}" width="${w}" customWidth="1"/>`).join('')
+      : '';
+    const rowsXml = sh.rows.map((row, ri) => {
+      if (!row || row.every(c=>c===null)) return `<row r="${ri+1}"/>`;
+      const cells = row.map((c,ci) => {
+        if (!c) return '';
+        const addr = `${colLetter(ci)}${ri+1}`;
+        const si = getStyle(c.s);
+        if (typeof c.v === 'number') {
+          return `<c r="${addr}" s="${si}" t="n"><v>${c.v}</v></c>`;
+        }
+        if (c.v === null || c.v === '') return `<c r="${addr}" s="${si}"/>`;
+        const idx = getSI(String(c.v));
+        return `<c r="${addr}" s="${si}" t="s"><v>${idx}</v></c>`;
+      }).join('');
+      return `<row r="${ri+1}">${cells}</row>`;
+    }).join('');
+    const mergesXml = sh.merges && sh.merges.length > 0
+      ? `<mergeCells count="${sh.merges.length}">${sh.merges.map(m=>`<mergeCell ref="${colLetter(m.c1)}${m.r1+1}:${colLetter(m.c2)}${m.r2+1}"/>`).join('')}</mergeCells>`
+      : '';
+    const freezeXml = sh.freezeRow
+      ? `<sheetViews><sheetView workbookViewId="0"><pane ySplit="${sh.freezeRow}" topLeftCell="A${sh.freezeRow+1}" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>`
+      : '<sheetViews><sheetView workbookViewId="0"/></sheetViews>';
+    return `<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">${tabXml}${freezeXml}<cols>${colsXml}</cols><sheetData>${rowsXml}</sheetData>${mergesXml}</worksheet>`;
+  }
+
+  // Construir ZIP usando fflate (disponible globalmente en browsers modernos via importmap)
+  // Usamos btoa/Blob + estructura OOXML manual como ZIP minimal
+  // Implementación ZIP minimal compatible con XLSX
+  function strToUint8(str: string): Uint8Array {
+    return new TextEncoder().encode(str);
+  }
+
+  function makeZip(files: Record<string, Uint8Array>): Uint8Array {
+    const encoder = new TextEncoder();
+    const centralDir: Uint8Array[] = [];
+    const localFiles: Uint8Array[] = [];
+    let offset = 0;
+
+    Object.entries(files).forEach(([name, data]) => {
+      const nameBytes = encoder.encode(name);
+      const crc = crc32(data);
+      const local = makeLocalHeader(nameBytes, data, crc);
+      localFiles.push(local);
+      centralDir.push(makeCentralHeader(nameBytes, data, crc, offset));
+      offset += local.length;
+    });
+
+    const cdSize = centralDir.reduce((a,b)=>a+b.length,0);
+    const eocd = makeEOCD(centralDir.length, cdSize, offset);
+    return concat([...localFiles, ...centralDir, eocd]);
+  }
+
+  function concat(arrays: Uint8Array[]): Uint8Array {
+    const total = arrays.reduce((a,b)=>a+b.length,0);
+    const out = new Uint8Array(total);
+    let off=0;
+    arrays.forEach(a=>{ out.set(a,off); off+=a.length; });
+    return out;
+  }
+
+  function uint32LE(n: number): Uint8Array {
+    const b=new Uint8Array(4);
+    b[0]=n&0xFF; b[1]=(n>>8)&0xFF; b[2]=(n>>16)&0xFF; b[3]=(n>>24)&0xFF;
+    return b;
+  }
+  function uint16LE(n: number): Uint8Array {
+    return new Uint8Array([n&0xFF,(n>>8)&0xFF]);
+  }
+
+  function crc32(data: Uint8Array): number {
+    const table = crc32table();
+    let crc=0xFFFFFFFF;
+    for(let i=0;i<data.length;i++) crc=(crc>>>8)^table[(crc^data[i])&0xFF];
+    return (crc^0xFFFFFFFF)>>>0;
+  }
+
+  function crc32table(): number[] {
+    const t:number[]=[];
+    for(let n=0;n<256;n++){
+      let c=n;
+      for(let k=0;k<8;k++) c=c&1?(0xEDB88320^(c>>>1)):(c>>>1);
+      t.push(c);
+    }
+    return t;
+  }
+
+  function makeLocalHeader(name: Uint8Array, data: Uint8Array, crc: number): Uint8Array {
+    return concat([
+      new Uint8Array([0x50,0x4B,0x03,0x04]), // sig
+      uint16LE(20),       // version needed
+      uint16LE(0),        // flags
+      uint16LE(0),        // compression: store
+      uint16LE(0),        // mod time
+      uint16LE(0),        // mod date
+      uint32LE(crc),
+      uint32LE(data.length),
+      uint32LE(data.length),
+      uint16LE(name.length),
+      uint16LE(0),        // extra len
+      name,
+      data,
+    ]);
+  }
+
+  function makeCentralHeader(name: Uint8Array, data: Uint8Array, crc: number, offset: number): Uint8Array {
+    return concat([
+      new Uint8Array([0x50,0x4B,0x01,0x02]), // sig
+      uint16LE(20),       // version made
+      uint16LE(20),       // version needed
+      uint16LE(0),        // flags
+      uint16LE(0),        // compression
+      uint16LE(0),        // mod time
+      uint16LE(0),        // mod date
+      uint32LE(crc),
+      uint32LE(data.length),
+      uint32LE(data.length),
+      uint16LE(name.length),
+      uint16LE(0),        // extra
+      uint16LE(0),        // comment
+      uint16LE(0),        // disk start
+      uint16LE(0),        // internal attr
+      uint32LE(0),        // external attr
+      uint32LE(offset),
+      name,
+    ]);
+  }
+
+  function makeEOCD(numEntries: number, cdSize: number, cdOffset: number): Uint8Array {
+    return concat([
+      new Uint8Array([0x50,0x4B,0x05,0x06]),
+      uint16LE(0), uint16LE(0),
+      uint16LE(numEntries), uint16LE(numEntries),
+      uint32LE(cdSize), uint32LE(cdOffset),
+      uint16LE(0),
+    ]);
+  }
+
+  // Generar sheets (necesitamos hacerlo DESPUÉS de pre-scan para tener stylesList completo)
+  const sheetXmls = sheets.map(sh => strToUint8(sheetXmlWithTab(sh)));
+  const stylesData = strToUint8(stylesXml());
+  const ssData = strToUint8(ssXml());
+  const wbData = strToUint8(workbookXml());
+  const wbRelsData = strToUint8(workbookRels());
+
+  const contentTypes = `<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+${sheets.map((_,i)=>`<Override PartName="/xl/worksheets/sheet${i+1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`).join('')}
+<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+<Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>
+</Types>`;
+
+  const rootRels = `<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>`;
+
+  const files: Record<string,Uint8Array> = {
+    '[Content_Types].xml': strToUint8(contentTypes),
+    '_rels/.rels': strToUint8(rootRels),
+    'xl/workbook.xml': wbData,
+    'xl/_rels/workbook.xml.rels': wbRelsData,
+    'xl/styles.xml': stylesData,
+    'xl/sharedStrings.xml': ssData,
+  };
+  sheets.forEach((_, i) => {
+    files[`xl/worksheets/sheet${i+1}.xml`] = sheetXmls[i];
   });
+
+  return new Blob([makeZip(files)], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
 }
 
 // ─── Función principal de exportación ────────────────────────────────────────
-async function exportShiftsToExcel(shifts: Shift[]) {
-  const wb = new ExcelJS.Workbook();
-  wb.creator = 'Boticas San José — Centro de Operaciones';
-  wb.created = new Date();
+function exportShiftsToExcel(shifts: Shift[]): void {
+  const xlSheets: XLSXSheet[] = [];
+  xlSheets.push(makeSummarySheet(shifts));
+  xlSheets.push(makeReferenceSheet());
 
-  // Hoja resumen primero
-  buildSummarySheet(wb, shifts);
-  buildReferenceSheet(wb);
-
-  // Una pestaña por empleado
   const empMap = new Map<number, { name: string; email: string; shifts: Shift[] }>();
   shifts.forEach(sh => {
     if (!empMap.has(sh.employee_id)) empMap.set(sh.employee_id, { name: sh.employee_name, email: sh.employee_email, shifts: [] });
     empMap.get(sh.employee_id)!.shifts.push(sh);
   });
-
   Array.from(empMap.entries())
     .sort((a, b) => a[1].name.localeCompare(b[1].name))
     .forEach(([, emp], i) => {
-      buildEmployeeSheet(wb, emp.name, emp.email, emp.shifts, TAB_COLORS[i % TAB_COLORS.length]);
+      xlSheets.push(makeEmployeeSheet(emp.name, emp.email, emp.shifts, TAB_COLORS[i % TAB_COLORS.length]));
     });
 
-  // Generar y descargar
-  const buffer = await wb.xlsx.writeBuffer();
+  const blob = buildXLSX(xlSheets);
   const now = new Date();
   const dateStr = `${now.getFullYear()}${String(now.getMonth()+1).padStart(2,'0')}${String(now.getDate()).padStart(2,'0')}`;
-  saveAs(new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), `Horarios_BoticasSanJose_${dateStr}.xlsx`);
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = `Horarios_BoticasSanJose_${dateStr}.xlsx`;
+  document.body.appendChild(a); a.click();
+  document.body.removeChild(a); URL.revokeObjectURL(url);
 }
 
 // ─── Botón de exportación ─────────────────────────────────────────────────────
@@ -375,11 +663,11 @@ const ExportShiftsButton: React.FC<{ shifts: Shift[] }> = ({ shifts }) => {
   const totalHoras = shifts.reduce((acc, sh) => acc + (SHIFT_HOURS[sh.shift_type] ?? 0), 0);
   const uniqueEmps = new Set(shifts.map(s => s.employee_id)).size;
 
-  const handle = async () => {
+  const handle = () => {
     if (status === 'loading') return;
     setStatus('loading');
     try {
-      await exportShiftsToExcel(shifts);
+      exportShiftsToExcel(shifts);
       setStatus('done');
       setTimeout(() => setStatus('idle'), 3000);
     } catch (e) { console.error(e); setStatus('idle'); }
